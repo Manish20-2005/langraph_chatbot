@@ -1,0 +1,7 @@
+chat.db
+checkpoints.db
+conversation.json
+__pycache__/
+*.pyc
+.env
+*.db
