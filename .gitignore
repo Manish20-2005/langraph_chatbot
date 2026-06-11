@@ -1,5 +1,6 @@
 chat.db
 checkpoints.db
+tempCodeRunnerFile.py
 conversation.json
 __pycache__/
 *.pyc
