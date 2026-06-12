@@ -3,19 +3,27 @@ app.py
 Production-ready AI chatbot — ChatGPT-style Streamlit UI.
 Conversation metadata is persisted to SQLite (chat.db).
 LangGraph checkpoints are persisted to SQLite (checkpoints.db).
+Documents uploaded for RAG are embedded and stored in a local FAISS index
+(./vectorstore/) via rag.py.
 
 Run with:
     streamlit run app.py
 
 Environment variables (set in .env):
     OPENAI_API_KEY   or   GOOGLE_API_KEY   or   MISTRAL_API_KEY
+    ENABLE_MCP=true        (optional) — load tools from mcp_config.json
 """
+
+import os
+import tempfile
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from database import DB
 from graph import stream_response
+from rag import clear_kb, ingest_file, kb_stats
 from utils import (
     export_chat_txt,
     format_timestamp,
@@ -49,15 +57,55 @@ html, body, [data-testid="stAppViewContainer"] {
     font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
 }
 
-/* ── Hide default Streamlit chrome ───────────────────────── */
-#MainMenu, footer, header { visibility: hidden; }
-[data-testid="stToolbar"] { display: none; }
+/* ── Hide ONLY the elements we don't want ────────────────── */
+/* NOTE: Do NOT hide [data-testid="stToolbar"] entirely — the
+   sidebar collapse/expand control lives in/near it on recent
+   Streamlit versions. Hiding the whole toolbar can make the
+   sidebar permanently uncollapsible if it ever closes. */
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
+
+/* FIX 1: Removed stray 's' character that was after the footer rule.
+   Original was: footer { visibility: hidden; }s
+   That 's' broke CSS parsing for everything that followed it. */
+
+/* FIX 2: Removed the incorrectly written CSS comment below.
+   Original was: # header { visibility: hidden; }
+   '#' is NOT a CSS comment — it's an ID selector. Using it here
+   accidentally matched any element with id="header" and corrupted
+   the surrounding rule parsing. CSS comments use /* like this. */
+
+/* FIX 3: Removed [data-testid="stToolbarActions"] { display: none }
+   On Streamlit >= 1.32, the sidebar expand/collapse button is rendered
+   inside stToolbarActions. Hiding it locks the sidebar in whatever
+   state it starts in (often collapsed on first load), making the
+   sidebar permanently inaccessible. We only hide the deploy button. */
+button[data-testid="stAppDeployButton"] { display: none !important; }
+button[title="View fullscreen"] { display: none !important; }
+
+/* Make sure the sidebar collapse / expand arrow is ALWAYS visible */
+[data-testid="collapsedControl"] {
+    display: flex !important;
+    visibility: visible !important;
+    color: #c8c8d4 !important;
+    z-index: 999999 !important;
+}
+[data-testid="collapsedControl"] svg {
+    fill: #c8c8d4 !important;
+}
 
 /* ── Sidebar ─────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
     background: #111114 !important;
-    border-right: 1px solid #1e1e24 !important;
+    border-right: 1px solid #2a2a38 !important;
     padding-top: 0 !important;
+    /* FIX 4: Removed min-width: 280px !important
+       A hard min-width with !important prevents Streamlit from collapsing
+       the sidebar — on first load in some versions the sidebar div is
+       zero-width while it "slides in", and the min-width override caused
+       it to render behind the main content, appearing invisible/missing.
+       Width is controlled by Streamlit's own layout engine; we leave it alone. */
+    visibility: visible !important;
 }
 [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
 
@@ -178,6 +226,37 @@ html, body, [data-testid="stAppViewContainer"] {
     margin-bottom: 0.5rem;
 }
 
+/* ── Sidebar section labels ──────────────────────────────── */
+.sidebar-section-label {
+    font-size: 0.7rem;
+    color: #8888a0;
+    padding: 0 0.25rem;
+    margin-bottom: 0.35rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+}
+
+/* ── File uploader ────────────────────────────────────────── */
+[data-testid="stFileUploader"] {
+    background: transparent !important;
+}
+[data-testid="stFileUploader"] section {
+    background: #16161c !important;
+    border: 1px dashed #3a3a52 !important;
+    border-radius: 10px !important;
+}
+[data-testid="stFileUploaderDropzone"] {
+    background: #16161c !important;
+}
+[data-testid="stFileUploader"] small,
+[data-testid="stFileUploader"] span,
+[data-testid="stFileUploader"] div,
+[data-testid="stFileUploader"] label,
+[data-testid="stFileUploader"] p {
+    color: #c8c8d4 !important;
+}
+
 /* ── Main layout ─────────────────────────────────────────── */
 [data-testid="stMain"] { background: #0d0d0f !important; }
 .block-container {
@@ -207,6 +286,9 @@ def init_session():
 
     if "generating" not in st.session_state:
         st.session_state.generating = False
+
+    if "last_uploaded_doc" not in st.session_state:
+        st.session_state.last_uploaded_doc = None
 
 
 init_session()
@@ -282,14 +364,12 @@ with st.sidebar:
 
     st.markdown("<div style='margin-top:0.5rem'></div>", unsafe_allow_html=True)
 
-    # Conversation list
+    # ── Conversation list ────────────────────────────────────
     conversations_sorted = sorted_conversations()
 
     if conversations_sorted:
         st.markdown(
-            "<p style='font-size:0.7rem;color:#444455;padding:0 0.25rem;"
-            "margin-bottom:0.35rem;text-transform:uppercase;letter-spacing:0.08em'>"
-            "Conversations</p>",
+            '<p class="sidebar-section-label">Conversations</p>',
             unsafe_allow_html=True,
         )
 
@@ -310,6 +390,63 @@ with st.sidebar:
             if st.button("✕", key=f"del_{tid}", help="Delete conversation"):
                 delete_conversation(tid)
                 st.rerun()
+
+    # ── Knowledge Base (RAG) ──────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<p class="sidebar-section-label">📚 Knowledge Base (RAG)</p>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded_doc = st.file_uploader(
+        "Upload a document",
+        type=["pdf", "txt", "md", "docx"],
+        label_visibility="visible",
+        help="Upload a PDF, TXT, Markdown, or Word document. The assistant "
+             "can then answer questions about it using query_knowledge_base.",
+        key="kb_file_uploader",
+    )
+
+    if uploaded_doc is not None and uploaded_doc.name != st.session_state.last_uploaded_doc:
+        with st.spinner(f"Indexing {uploaded_doc.name}…"):
+            suffix = Path(uploaded_doc.name).suffix
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(uploaded_doc.getvalue())
+                    tmp_path = tmp.name
+
+                n_chunks = ingest_file(tmp_path, uploaded_doc.name)
+                st.session_state.last_uploaded_doc = uploaded_doc.name
+
+                if n_chunks > 0:
+                    st.success(f"✅ Indexed **{uploaded_doc.name}** ({n_chunks} chunks)")
+                else:
+                    st.warning(f"⚠️ No text could be extracted from {uploaded_doc.name}")
+
+            except Exception as e:
+                st.error(f"❌ Failed to index document: {e}")
+
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    stats = kb_stats()
+    if stats["exists"]:
+        st.caption(f"📦 {stats['chunks']} chunk(s) indexed")
+        if st.button("🗑  Clear Knowledge Base", use_container_width=True):
+            clear_kb()
+            st.session_state.last_uploaded_doc = None
+            st.rerun()
+    else:
+        st.caption("No documents indexed yet")
+
+    # ── Tools status (built-in + MCP) ─────────────────────────
+    available_tools = st.session_state.get("available_tools")
+    if available_tools:
+        with st.expander(f"🛠️ {len(available_tools)} tools available"):
+            for t in available_tools:
+                st.caption(f"• {t}")
 
     # ── Sidebar footer ──
     if st.session_state.active_thread:
@@ -350,7 +487,8 @@ if not active_tid:
             <h2>What can I help with?</h2>
             <p>Start a new conversation from the sidebar, or pick an existing one.</p>
             <p style="font-size:0.78rem;margin-top:1rem;color:#33334a">
-                Conversations persist across restarts via SQLite.
+                Conversations persist across restarts via SQLite. Upload documents
+                in the sidebar to enable retrieval-augmented (RAG) answers.
             </p>
         </div>
         """,
