@@ -23,7 +23,8 @@ A production-ready, **ChatGPT-style chatbot** built with **Streamlit**, **LangGr
 - 🔄 **Automatic retry with exponential backoff** for rate-limited API calls
 - 📊 **LangSmith observability** support (optional)
 - 📝 **Auto-generated chat titles** from the first message
-
+-    **RAG System** -can take pdf,word file take your queries based on your document
+-    **MCP Uses** -use mcp for the better tool use not breaking
 ---
 
 ## 🛠️ Tools
